@@ -1,4 +1,14 @@
-// app.js (THP-proof, cgroup-aware, sticky-friendly)
+// app.js — THP-aware RSS demonstrator (safe on small RAM)
+// Run with: node --expose-gc app.js
+// Env knobs (all optional):
+//   STICKY_PRESET=1            -> many ~1–2MB buffers (good on 1–2 GB hosts)
+//   ALLOC_OBJECTS=24           -> how many buffers per wave
+//   ALLOC_SIZE_MB=64           -> size of each buffer (can be fractional, e.g. 1.5)
+//   HOLD_MS=2500               -> hold time before free+GC
+//   TARGET_UTIL=0.80           -> auto-throttle to % of cgroup/host limit
+//   GLIBC_TUNABLES=glibc.malloc.arena_max=64  (optional: stickier RSS)
+// Tip: A/B test THP on the host: `echo always|sudo tee .../enabled` vs `echo never|sudo tee .../enabled`
+
 const fs = require('fs');
 
 const MB = 1024 * 1024;
@@ -23,28 +33,25 @@ function toInt(s, d=0){ const n = Number(s); return Number.isFinite(n) ? n : d; 
 // ---------- Config (env) ----------
 const STICKY_PRESET = (process.env.STICKY_PRESET || '0') === '1'; // many small buffers
 const OBJ  = Number(process.env.ALLOC_OBJECTS ?? (STICKY_PRESET ? 120 : 8));
-const SIZE_MB_RAW = Number(process.env.ALLOC_SIZE_MB ?? (STICKY_PRESET ? 1.5 : 16)); // allow fractional
+const SIZE_MB_RAW = Number(process.env.ALLOC_SIZE_MB ?? (STICKY_PRESET ? 1.5 : 16)); // fractional ok
 const HOLD = Number(process.env.HOLD_MS ?? 1500);
 const TARGET_UTIL = Math.min(Math.max(Number(process.env.TARGET_UTIL || 0.80), 0.10), 0.95); // 10–95%
-
-// ensure integer bytes; keep >= 1 byte
 const SIZE_BYTES = Math.max(1, Math.floor(SIZE_MB_RAW * MB));
 
-// ---------- THP/cgroup helpers ----------
+// ---------- THP / cgroup ----------
 function thpMode() {
-  const t = rd(PATHS.thpEnabled);
-  if (!t) return 'unknown';
-  // e.g. "[always] madvise never"
+  const t = rd(PATHS.thpEnabled) || '';
   if (/\[always\]/.test(t)) return 'always';
   if (/\[madvise\]/.test(t)) return 'madvise';
   if (/\[never\]/.test(t)) return 'never';
-  return t.trim();
+  return t.trim() || 'unknown';
 }
 function cgLimitBytes() {
   let v = rd(PATHS.cg2Max);
   if (v) return v.trim() === 'max' ? Infinity : toInt(v.trim(), Infinity);
   v = rd(PATHS.cg1Max);
   if (v) return toInt(v.trim(), Infinity);
+  // bare metal / no limit
   return Infinity;
 }
 function cgCurrentBytes() {
@@ -52,6 +59,7 @@ function cgCurrentBytes() {
   if (v) return toInt(v.trim(), 0);
   v = rd(PATHS.cg1Cur);
   if (v) return toInt(v.trim(), 0);
+  // rough fallback
   return 0;
 }
 
@@ -62,9 +70,7 @@ function parseKeyKB(text, key) {
 }
 function readMem() {
   const r = rd(PATHS.smapsRollup);
-  if (r) {
-    return { rssKB: parseKeyKB(r, 'Rss'), anonHugeKB: parseKeyKB(r, 'AnonHugePages') };
-  }
+  if (r) return { rssKB: parseKeyKB(r, 'Rss'), anonHugeKB: parseKeyKB(r, 'AnonHugePages') };
   const s = rd(PATHS.smaps);
   if (s) {
     let rssKB = 0, anonHugeKB = 0;
@@ -85,18 +91,14 @@ function readMem() {
 function printUsage(tag) {
   const mu = process.memoryUsage();
   const m = readMem();
-  const parts = [
-    `[${new Date().toISOString()}] ${tag}`,
-    `rss=${mb(mu.rss)}MB`,
-    `heapUsed=${mb(mu.heapUsed)}MB`,
-    `external=${mb(mu.external)}MB`,
-    `AnonHugePages=${mb(m.anonHugeKB * 1024)}MB`,
-    `RssRollup=${mb(m.rssKB * 1024)}MB`,
-  ];
-  console.log(parts.join(' | '));
+  console.log(
+    `[${new Date().toISOString()}] ${tag} | ` +
+    `rss=${mb(mu.rss)}MB | heapUsed=${mb(mu.heapUsed)}MB | external=${mb(mu.external)}MB | ` +
+    `AnonHugePages=${mb(m.anonHugeKB * 1024)}MB | RssRollup=${mb(m.rssKB * 1024)}MB`
+  );
 }
 
-// fault pages in so RSS truly rises (and THP can coalesce)
+// touch pages to ensure commit (and let THP/khugepaged coalesce)
 function touch(buf) {
   const page = 4096;
   for (let i = 0; i < buf.length; i += page) buf[i] = 1;
@@ -105,7 +107,7 @@ function touch(buf) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Auto-throttle objects if we’re too close to cgroup limit
+// plan objects so we don’t blow past cgroup/host limit
 function planObjects(objects, sizeBytes) {
   const limit = cgLimitBytes();
   if (!Number.isFinite(limit) || limit <= 0) return objects;
@@ -118,7 +120,7 @@ function planObjects(objects, sizeBytes) {
 async function wave({ objects = OBJ, sizeBytes = SIZE_BYTES, holdMs = HOLD }) {
   const planned = planObjects(objects, sizeBytes);
   if (planned < objects) {
-    console.log(`[throttle] reducing objects ${objects} -> ${planned} (cgroup util target ${Math.round(TARGET_UTIL*100)}%)`);
+    console.log(`[throttle] reducing objects ${objects} -> ${planned} (target util ${Math.round(TARGET_UTIL*100)}%)`);
   }
   objects = planned;
 
@@ -149,7 +151,7 @@ async function wave({ objects = OBJ, sizeBytes = SIZE_BYTES, holdMs = HOLD }) {
   await sleep(1000);
 }
 
-// signal logs (helps diagnose exit 137 vs graceful)
+// signal logs help diagnose 137 exits vs graceful
 process.on('SIGTERM', () => { console.log('[SIGNAL] SIGTERM'); setTimeout(()=>process.exit(143), 10); });
 process.on('SIGINT',  () => { console.log('[SIGNAL] SIGINT');  setTimeout(()=>process.exit(130), 10); });
 
@@ -157,11 +159,10 @@ process.on('SIGINT',  () => { console.log('[SIGNAL] SIGINT');  setTimeout(()=>pr
   console.log('THP demo starting…');
   console.log(`THP mode: ${thpMode()}`);
   const lim = cgLimitBytes();
-  console.log(`cgroup limit: ${Number.isFinite(lim) ? (mb(lim)+'MB') : 'unlimited'}`);
+  console.log(`cgroup/host limit seen: ${Number.isFinite(lim) ? (mb(lim)+'MB') : 'unlimited'}`);
   printUsage('START');
 
   let w = 1;
-  // loop forever
   while (true) {
     console.log(`\n=== WAVE ${w++} ===`);
     await wave({});
