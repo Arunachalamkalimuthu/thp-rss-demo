@@ -1,0 +1,53 @@
+{
+    "id": null,
+    "title": "THP RSS Demo",
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "5s",
+    "templating": {
+      "list": [
+        {
+          "name": "service",
+          "type": "query",
+          "datasource": "Prometheus",
+          "query": "label_values(container_memory_working_set_bytes, container_label_com_docker_compose_service)",
+          "includeAll": false,
+          "multi": false,
+          "current": { "text": "thp-rss-demo", "value": "thp-rss-demo", "selected": true }
+        }
+      ]
+    },
+    "panels": [
+      {
+        "type": "timeseries",
+        "title": "Container Memory RSS (bytes)",
+        "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 },
+        "targets": [
+          {
+            "datasource": "Prometheus",
+            "expr": "container_memory_rss{container_label_com_docker_compose_service=\"$service\"}",
+            "legendFormat": "RSS"
+          }
+        ]
+      },
+      {
+        "type": "timeseries",
+        "title": "Working Set vs RSS",
+        "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 },
+        "targets": [
+          {
+            "datasource": "Prometheus",
+            "expr": "container_memory_working_set_bytes{container_label_com_docker_compose_service=\"$service\"}",
+            "legendFormat": "Working Set"
+          },
+          {
+            "datasource": "Prometheus",
+            "expr": "container_memory_rss{container_label_com_docker_compose_service=\"$service\"}",
+            "legendFormat": "RSS"
+          }
+        ]
+      }
+    ]
+  }
+  
