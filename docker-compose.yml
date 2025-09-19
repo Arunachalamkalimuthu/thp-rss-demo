@@ -7,9 +7,9 @@ services:
     labels:
       com.docker.compose.service: thp-rss-demo
     environment:
-      ALLOC_OBJECTS: "48"
-      ALLOC_SIZE_MB: "48"
-      HOLD_MS: "3000"
+      ALLOC_OBJECTS: "8"
+      ALLOC_SIZE_MB: "16"
+      HOLD_MS: "2000"
     deploy:
       resources:
         limits:
