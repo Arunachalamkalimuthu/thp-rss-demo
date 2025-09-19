@@ -37,7 +37,11 @@ function touch(buf) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function wave({ objects = 32, sizeMB = 32, holdMs = 2000 }) {
+const OBJ  = Number(process.env.ALLOC_OBJECTS || 32);
+const SIZE = Number(process.env.ALLOC_SIZE_MB || 32);
+const HOLD = Number(process.env.HOLD_MS || 2000);
+
+async function wave({ objects = OBJ, sizeMB = SIZE, holdMs = HOLD }) {
   const size = sizeMB * 1024 * 1024;
   const arr = new Array(objects);
   printUsage(`BEFORE allocate (${objects} x ${sizeMB}MB)`);

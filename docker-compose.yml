@@ -6,7 +6,10 @@ services:
     container_name: thp-rss-demo
     labels:
       com.docker.compose.service: thp-rss-demo
-    # No ports needed; it just runs and alloc/frees memory
+    environment:
+      ALLOC_OBJECTS: "48"
+      ALLOC_SIZE_MB: "48"
+      HOLD_MS: "3000"
     deploy:
       resources:
         limits:
