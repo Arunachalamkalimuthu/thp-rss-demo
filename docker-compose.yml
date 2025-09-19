@@ -10,10 +10,6 @@ services:
       ALLOC_OBJECTS: "8"
       ALLOC_SIZE_MB: "16"
       HOLD_MS: "2000"
-    deploy:
-      resources:
-        limits:
-          memory: 2g    # optional cap; adjust as you like
 
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.47.2
