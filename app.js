@@ -1,46 +1,81 @@
-// app.js (robust)
+// app.js (THP-proof, cgroup-aware, sticky-friendly)
 const fs = require('fs');
 
 const MB = 1024 * 1024;
-const PATH_SMAPS_ROLLUP = '/proc/self/smaps_rollup';
-const PATH_STATUS = '/proc/self/status';
-const PATH_SMAPS = '/proc/self/smaps';
-const PATH_MEMINFO = '/proc/meminfo';
+const PATHS = {
+  thpEnabled: '/sys/kernel/mm/transparent_hugepage/enabled',
+  smapsRollup: '/proc/self/smaps_rollup',
+  smaps: '/proc/self/smaps',
+  status: '/proc/self/status',
+  meminfo: '/proc/meminfo',
+  // cgroup v2
+  cg2Max: '/sys/fs/cgroup/memory.max',
+  cg2Cur: '/sys/fs/cgroup/memory.current',
+  // cgroup v1 fallback
+  cg1Max: '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+  cg1Cur: '/sys/fs/cgroup/memory/memory.usage_in_bytes',
+};
 
-const OBJ  = Number(process.env.ALLOC_OBJECTS || 8);    // safer defaults
-const SIZE = Number(process.env.ALLOC_SIZE_MB || 16);   // 8*16MB = 128MB per wave
-const HOLD = Number(process.env.HOLD_MS || 1500);
-
+function rd(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
 function mb(n) { return (n / MB).toFixed(1); }
-function readFileSafe(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
+function toInt(s, d=0){ const n = Number(s); return Number.isFinite(n) ? n : d; }
 
+// ---------- Config (env) ----------
+const STICKY_PRESET = (process.env.STICKY_PRESET || '0') === '1'; // many small buffers
+const OBJ  = Number(process.env.ALLOC_OBJECTS ?? (STICKY_PRESET ? 120 : 8));
+const SIZE_MB_RAW = Number(process.env.ALLOC_SIZE_MB ?? (STICKY_PRESET ? 1.5 : 16)); // allow fractional
+const HOLD = Number(process.env.HOLD_MS ?? 1500);
+const TARGET_UTIL = Math.min(Math.max(Number(process.env.TARGET_UTIL || 0.80), 0.10), 0.95); // 10–95%
+
+// ensure integer bytes; keep >= 1 byte
+const SIZE_BYTES = Math.max(1, Math.floor(SIZE_MB_RAW * MB));
+
+// ---------- THP/cgroup helpers ----------
+function thpMode() {
+  const t = rd(PATHS.thpEnabled);
+  if (!t) return 'unknown';
+  // e.g. "[always] madvise never"
+  if (/\[always\]/.test(t)) return 'always';
+  if (/\[madvise\]/.test(t)) return 'madvise';
+  if (/\[never\]/.test(t)) return 'never';
+  return t.trim();
+}
+function cgLimitBytes() {
+  let v = rd(PATHS.cg2Max);
+  if (v) return v.trim() === 'max' ? Infinity : toInt(v.trim(), Infinity);
+  v = rd(PATHS.cg1Max);
+  if (v) return toInt(v.trim(), Infinity);
+  return Infinity;
+}
+function cgCurrentBytes() {
+  let v = rd(PATHS.cg2Cur);
+  if (v) return toInt(v.trim(), 0);
+  v = rd(PATHS.cg1Cur);
+  if (v) return toInt(v.trim(), 0);
+  return 0;
+}
+
+// ---------- memory reading ----------
 function parseKeyKB(text, key) {
   const m = text && text.match(new RegExp(`^${key}:\\s+(\\d+) kB`, 'm'));
   return m ? Number(m[1]) : 0;
 }
-
-// Try smaps_rollup; else sum smaps; else fall back to status + meminfo
 function readMem() {
-  const roll = readFileSafe(PATH_SMAPS_ROLLUP);
-  if (roll) {
-    return {
-      rssKB: parseKeyKB(roll, 'Rss'),
-      anonHugeKB: parseKeyKB(roll, 'AnonHugePages'),
-    };
+  const r = rd(PATHS.smapsRollup);
+  if (r) {
+    return { rssKB: parseKeyKB(r, 'Rss'), anonHugeKB: parseKeyKB(r, 'AnonHugePages') };
   }
-  // sum /proc/self/smaps (slower but robust)
-  const smaps = readFileSafe(PATH_SMAPS);
-  if (smaps) {
+  const s = rd(PATHS.smaps);
+  if (s) {
     let rssKB = 0, anonHugeKB = 0;
-    for (const line of smaps.split('\n')) {
+    for (const line of s.split('\n')) {
       if (line.startsWith('Rss:')) rssKB += parseInt(line.split(/\s+/)[1] || '0', 10);
       else if (line.startsWith('AnonHugePages:')) anonHugeKB += parseInt(line.split(/\s+/)[1] || '0', 10);
     }
     return { rssKB, anonHugeKB };
   }
-  // last resort: process.rss + system AnonHugePages
-  const status = readFileSafe(PATH_STATUS);
-  const meminfo = readFileSafe(PATH_MEMINFO);
+  const status = rd(PATHS.status);
+  const meminfo = rd(PATHS.meminfo);
   return {
     rssKB: status ? parseKeyKB(status, 'VmRSS') : Math.round(process.memoryUsage().rss / 1024),
     anonHugeKB: meminfo ? parseKeyKB(meminfo, 'AnonHugePages') : 0,
@@ -61,23 +96,39 @@ function printUsage(tag) {
   console.log(parts.join(' | '));
 }
 
+// fault pages in so RSS truly rises (and THP can coalesce)
 function touch(buf) {
   const page = 4096;
   for (let i = 0; i < buf.length; i += page) buf[i] = 1;
   if (buf.length % page) buf[buf.length - 1] = 1;
 }
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function wave({ objects = OBJ, sizeMB = SIZE, holdMs = HOLD }) {
-  const size = sizeMB * MB;
+// Auto-throttle objects if we’re too close to cgroup limit
+function planObjects(objects, sizeBytes) {
+  const limit = cgLimitBytes();
+  if (!Number.isFinite(limit) || limit <= 0) return objects;
+  const cur = cgCurrentBytes();
+  const headroom = Math.max(0, TARGET_UTIL * limit - cur);
+  const fit = Math.max(1, Math.floor(headroom / sizeBytes));
+  return Math.min(objects, fit);
+}
+
+async function wave({ objects = OBJ, sizeBytes = SIZE_BYTES, holdMs = HOLD }) {
+  const planned = planObjects(objects, sizeBytes);
+  if (planned < objects) {
+    console.log(`[throttle] reducing objects ${objects} -> ${planned} (cgroup util target ${Math.round(TARGET_UTIL*100)}%)`);
+  }
+  objects = planned;
+
   const arr = new Array(objects);
-  printUsage(`BEFORE allocate (${objects} x ${sizeMB}MB)`);
+  printUsage(`BEFORE allocate (${objects} x ${(sizeBytes/MB).toFixed(2)}MB)`);
 
   try {
     for (let i = 0; i < objects; i++) {
-      arr[i] = Buffer.allocUnsafe(size);
-      touch(arr[i]);              // fault pages in so RSS truly rises
+      arr[i] = Buffer.allocUnsafe(sizeBytes);
+      touch(arr[i]);
     }
     printUsage('AFTER allocate');
   } catch (e) {
@@ -98,10 +149,19 @@ async function wave({ objects = OBJ, sizeMB = SIZE, holdMs = HOLD }) {
   await sleep(1000);
 }
 
+// signal logs (helps diagnose exit 137 vs graceful)
+process.on('SIGTERM', () => { console.log('[SIGNAL] SIGTERM'); setTimeout(()=>process.exit(143), 10); });
+process.on('SIGINT',  () => { console.log('[SIGNAL] SIGINT');  setTimeout(()=>process.exit(130), 10); });
+
 (async () => {
   console.log('THP demo starting…');
+  console.log(`THP mode: ${thpMode()}`);
+  const lim = cgLimitBytes();
+  console.log(`cgroup limit: ${Number.isFinite(lim) ? (mb(lim)+'MB') : 'unlimited'}`);
   printUsage('START');
+
   let w = 1;
+  // loop forever
   while (true) {
     console.log(`\n=== WAVE ${w++} ===`);
     await wave({});
